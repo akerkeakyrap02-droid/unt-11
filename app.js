@@ -10,6 +10,10 @@ let flash = "";
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+const isNew = (d) => !!d && Date.now() - new Date(d).getTime() < 7 * 86400000;
+const pct = (score, max) => (Number(max) > 0 ? Math.round((Number(score) / Number(max)) * 100) : null);
+const fmtDate = (d) => new Date(d).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
 
 /* ---------- Theme ---------- */
 function storedTheme() {
@@ -24,12 +28,11 @@ document.documentElement.dataset.theme =
 const toggleTheme = () =>
   setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
 
-/* ---------- Helpers ---------- */
+/* ---------- Auth helpers ---------- */
 const toAuthEmail = (id) => {
   const v = id.trim().toLowerCase();
   return v.includes("@") ? v : `${v}@${USERNAME_EMAIL_DOMAIN}`;
 };
-const isSyntheticEmail = (e) => !!e && e.endsWith(`@${USERNAME_EMAIL_DOMAIN}`);
 
 function friendly(error) {
   const m = (error?.message || "").toLowerCase();
@@ -48,7 +51,7 @@ function setMsg(text, kind = "error") {
   el.className = `msg ${text ? kind : ""}`;
 }
 
-/* ---------- Views ---------- */
+/* ---------- Auth screens ---------- */
 function authShell(inner) {
   app.innerHTML = `
     <main class="auth">
@@ -66,7 +69,7 @@ function authShell(inner) {
 function renderSetup() {
   authShell(`
     <h2>Connect your database</h2>
-    <p>Open <strong>js/config.js</strong> and paste your Supabase project URL and anon key. The README has the full steps.</p>`);
+    <p>Open <strong>config.js</strong> and paste your Supabase project URL and key.</p>`);
 }
 
 function renderLogin() {
@@ -155,44 +158,253 @@ async function renderSignup() {
       setMsg("Account created. Check your email to confirm it, then log in.", "ok");
       btn.disabled = false;
     }
-    // With a session, onAuthStateChange takes the student to the home screen.
   });
 }
 
-async function renderAccount() {
-  const isTeacher = profile.role === "teacher";
-  const showEmail = profile.email && !isSyntheticEmail(profile.email);
+/* ---------- App shell ---------- */
+const isTeacher = () => profile?.role === "teacher";
 
-  app.innerHTML = `
+function topbar() {
+  return `
     <header class="topbar">
-      <span class="brand">English Test Prep</span>
+      <a class="brand" href="#/">English Test Prep</a>
+      ${isTeacher() ? `<span class="badge plain">Teacher</span>` : ""}
       <button class="btn ghost small" id="theme" type="button">Light / dark</button>
       <button class="btn ghost small" id="out" type="button">Log out</button>
-    </header>
-    <main class="page">
-      <h1>Hello, ${esc(profile.name.split(" ")[0])}</h1>
-      <div class="card">
-        <h2>Your account</h2>
-        <dl class="facts">
-          <dt>Role</dt><dd>${isTeacher ? "Teacher" : "Student"}</dd>
-          <dt>Username</dt><dd>${esc(profile.username || "-")}</dd>
-          ${showEmail ? `<dt>Email</dt><dd>${esc(profile.email)}</dd>` : ""}
-          <dt>Group</dt><dd>${esc(profile.groups?.name || "Not set")}</dd>
-        </dl>
-      </div>
-      <div class="card" id="db"><h2>Database</h2><p>Checking connection...</p></div>
-    </main>`;
-
+    </header>`;
+}
+function bindTopbar() {
   document.getElementById("theme").addEventListener("click", toggleTheme);
   document.getElementById("out").addEventListener("click", () => supabase.auth.signOut());
+}
+function showPage(inner, wide = true) {
+  app.innerHTML = `${topbar()}<main class="page${wide ? " wide" : ""}">${inner}</main>`;
+  bindTopbar();
+}
 
-  const { count, error } = await supabase.from("topic_cards").select("id", { count: "exact", head: true });
-  document.getElementById("db").innerHTML = error
-    ? `<h2>Database</h2><p class="msg error">Could not read topics: ${esc(error.message)}</p>`
-    : `<h2>Database</h2><p><span class="badge">Connected</span> ${count} topic cards found.</p>
-       <p class="hint">${isTeacher
-         ? "Teacher access confirmed. Test creation arrives in step 3."
-         : "Topic cards arrive in step 2."}</p>`;
+/* ---------- Home: newest tests + topic cards ---------- */
+let cards = [];
+
+function cardHtml(c, best) {
+  const teacher = isTeacher();
+  const available = c.published_tests > 0;
+  const target = c.target_question_count;
+  const fresh = isNew(c.latest_live_at);
+
+  let stats;
+  if (teacher) {
+    const q = c.published_questions;
+    stats = target
+      ? `<strong>${q}/${target}</strong> questions published
+         <span class="bar" role="img" aria-label="${q} of ${target} questions"><i style="width:${Math.min(100, Math.round((q / target) * 100))}%"></i></span>`
+      : `<strong>${q}</strong> questions published`;
+    stats += `<br>${plural(c.published_tests, "published test", "published tests")}`;
+  } else if (available) {
+    stats = `${plural(c.published_tests, "test", "tests")} &middot; ${plural(c.published_questions, "question", "questions")}`;
+    stats += best != null ? `<br>Best score: <strong>${best}%</strong>` : `<br>Not attempted yet`;
+  } else {
+    stats = `New tests are added regularly.`;
+  }
+
+  const tools = teacher ? `
+    <div class="tools" data-id="${esc(c.id)}">
+      <button class="btn ghost tiny" data-act="up" aria-label="Move up">&uarr;</button>
+      <button class="btn ghost tiny" data-act="down" aria-label="Move down">&darr;</button>
+      <button class="btn ghost tiny" data-act="rename">Rename</button>
+      <button class="btn ghost tiny" data-act="target">Target</button>
+      <button class="btn ghost tiny" data-act="hide">${c.hidden ? "Show" : "Hide"}</button>
+      <button class="btn ghost tiny danger" data-act="delete">Delete</button>
+    </div>` : "";
+
+  return `
+    <li class="topic ${available ? "available" : "soon"}${c.hidden ? " is-hidden" : ""}">
+      <a class="topic-link" href="#/topic/${esc(c.id)}">
+        <h3>${esc(c.title)}</h3>
+        <div class="topic-line">
+          <span class="status">${available ? "Available" : "Coming soon"}</span>
+          ${fresh ? `<span class="badge">New</span>` : ""}
+          ${c.hidden ? `<span class="badge plain">Hidden from students</span>` : ""}
+        </div>
+        <p class="stats">${stats}</p>
+      </a>
+      ${tools}
+    </li>`;
+}
+
+async function renderHome() {
+  showPage(`<h1>Practice by topic</h1><p class="empty">Loading...</p>`);
+  const teacher = isTeacher();
+
+  const [cardsRes, newestRes, attRes] = await Promise.all([
+    supabase.from("topic_cards").select("*").order("sort_order"),
+    supabase.from("live_tests").select("id,title,topic_id,live_since,question_count")
+      .order("live_since", { ascending: false }).limit(5),
+    teacher
+      ? Promise.resolve({ data: [] })
+      : supabase.from("attempts").select("score,max_score,tests(topic_id)")
+          .eq("user_id", profile.id).not("submitted_at", "is", null),
+  ]);
+
+  if (cardsRes.error) {
+    return showPage(`<h1>Practice by topic</h1><p class="msg error">Could not load topics: ${esc(cardsRes.error.message)}</p>`);
+  }
+  cards = cardsRes.data || [];
+  const titleById = Object.fromEntries(cards.map((c) => [c.id, c.title]));
+
+  const bestByTopic = {};
+  for (const a of attRes.data || []) {
+    const tid = a.tests?.topic_id;
+    const p = pct(a.score, a.max_score);
+    if (tid && p != null) bestByTopic[tid] = Math.max(bestByTopic[tid] ?? 0, p);
+  }
+
+  const newest = newestRes.data || [];
+  const newestHtml = newest.length
+    ? `<ul class="newest">${newest.map((t) => `
+        <li><a href="#/topic/${esc(t.topic_id)}">
+          <span class="t">${esc(t.title)}</span>
+          ${isNew(t.live_since) ? `<span class="badge">New</span>` : ""}
+          <span class="sub">${esc(titleById[t.topic_id] || "")} &middot; ${plural(t.question_count, "question", "questions")}</span>
+        </a></li>`).join("")}</ul>`
+    : `<p class="empty">No tests yet. New tests are added regularly.</p>`;
+
+  showPage(`
+    <h1>Practice by topic</h1>
+    <div class="section-head"><h2>Newest tests</h2></div>
+    ${newestHtml}
+    <div class="section-head">
+      <h2>All topics</h2>
+      ${teacher ? `<button class="btn small" id="add-topic" type="button">Add topic</button>` : ""}
+    </div>
+    ${cards.length
+      ? `<ul class="grid" id="grid">${cards.map((c) => cardHtml(c, bestByTopic[c.id])).join("")}</ul>`
+      : `<p class="empty">${teacher ? "No topics yet. Click Add topic." : "No topics yet. Check back soon."}</p>`}
+  `);
+
+  if (teacher) bindTeacherTools();
+}
+
+/* ---------- Teacher: manage topic cards ---------- */
+function bindTeacherTools() {
+  document.getElementById("add-topic")?.addEventListener("click", async () => {
+    const title = prompt("Name of the new topic:");
+    if (!title?.trim()) return;
+    const next = (cards.reduce((m, c) => Math.max(m, c.sort_order), 0) || 0) + 1;
+    const { error } = await supabase.from("topics").insert({ title: title.trim(), sort_order: next });
+    if (error) alert(error.message);
+    renderHome();
+  });
+
+  document.getElementById("grid")?.addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    const id = btn.closest(".tools").dataset.id;
+    const idx = cards.findIndex((c) => c.id === id);
+    const c = cards[idx];
+    if (!c) return;
+    let error = null;
+
+    switch (btn.dataset.act) {
+      case "up":
+      case "down": {
+        const other = cards[idx + (btn.dataset.act === "up" ? -1 : 1)];
+        if (!other) return;
+        // If two cards share a sort_order, spread them first so the swap is visible.
+        const a = c.sort_order, b = other.sort_order;
+        const aNew = a === b ? a + (btn.dataset.act === "up" ? -1 : 1) : b;
+        const r1 = await supabase.from("topics").update({ sort_order: aNew }).eq("id", c.id);
+        const r2 = a === b ? { error: null } : await supabase.from("topics").update({ sort_order: a }).eq("id", other.id);
+        error = r1.error || r2.error;
+        break;
+      }
+      case "rename": {
+        const title = prompt("New name:", c.title);
+        if (!title?.trim() || title.trim() === c.title) return;
+        ({ error } = await supabase.from("topics").update({ title: title.trim() }).eq("id", id));
+        break;
+      }
+      case "target": {
+        const v = prompt("Target number of questions (leave empty for none):", c.target_question_count ?? "");
+        if (v === null) return;
+        const n = v.trim() === "" ? null : parseInt(v, 10);
+        if (n !== null && (Number.isNaN(n) || n < 0)) return alert("Enter a whole number, or leave it empty.");
+        ({ error } = await supabase.from("topics").update({ target_question_count: n }).eq("id", id));
+        break;
+      }
+      case "hide":
+        ({ error } = await supabase.from("topics").update({ hidden: !c.hidden }).eq("id", id));
+        break;
+      case "delete":
+        if (!confirm(`Delete "${c.title}"?\n\nThis also deletes its tests, questions and all student attempts. This cannot be undone.`)) return;
+        ({ error } = await supabase.from("topics").delete().eq("id", id));
+        break;
+    }
+    if (error) alert(error.message);
+    renderHome();
+  });
+}
+
+/* ---------- Topic page ---------- */
+async function renderTopic(id) {
+  showPage(`<a class="back" href="#/">&larr; All topics</a><p class="empty">Loading...</p>`, false);
+  const teacher = isTeacher();
+
+  const { data: topic } = await supabase.from("topics").select("*").eq("id", id).maybeSingle();
+  if (!topic) {
+    return showPage(`<a class="back" href="#/">&larr; All topics</a><h1>Topic not found</h1><p>This topic is not available.</p>`, false);
+  }
+
+  const { data: tests } = await supabase.from("live_tests")
+    .select("id,title,question_count,live_since").eq("topic_id", id).order("created_at");
+  const list = tests || [];
+
+  let attempts = [];
+  if (!teacher && list.length) {
+    const r = await supabase.from("attempts").select("id,test_id,score,max_score,submitted_at")
+      .eq("user_id", profile.id).in("test_id", list.map((t) => t.id))
+      .not("submitted_at", "is", null).order("submitted_at", { ascending: false });
+    attempts = r.data || [];
+  }
+  const titleByTest = Object.fromEntries(list.map((t) => [t.id, t.title]));
+  const bestByTest = {};
+  for (const a of attempts) {
+    const p = pct(a.score, a.max_score);
+    if (p != null) bestByTest[a.test_id] = Math.max(bestByTest[a.test_id] ?? 0, p);
+  }
+
+  const study = topic.study_content?.trim()
+    ? `<div class="card"><h2>Study</h2><div class="study">${esc(topic.study_content)}</div></div>` : "";
+
+  const testsHtml = list.length
+    ? list.map((t) => `
+        <div class="test-row">
+          <div class="grow">
+            <strong>${esc(t.title)}</strong> ${isNew(t.live_since) ? `<span class="badge">New</span>` : ""}
+            <span class="sub">${plural(t.question_count, "question", "questions")}${
+              bestByTest[t.id] != null ? ` &middot; Best score: ${bestByTest[t.id]}%` : ""}</span>
+          </div>
+          <button class="btn small" type="button" disabled>Start</button>
+        </div>`).join("") +
+      `<p class="hint">Starting a test arrives in step 4.</p>`
+    : `<p class="empty">Coming soon. New tests are added regularly.</p>`;
+
+  const historyHtml = teacher ? "" : `
+    <div class="card">
+      <h2>Your attempts</h2>
+      ${attempts.length
+        ? `<ul class="history">${attempts.map((a) => `
+            <li><span>${esc(titleByTest[a.test_id] || "Test")} <span class="hint">${fmtDate(a.submitted_at)}</span></span>
+            <strong>${pct(a.score, a.max_score) ?? 0}%</strong></li>`).join("")}</ul>`
+        : `<p class="empty">No attempts yet.</p>`}
+    </div>`;
+
+  showPage(`
+    <a class="back" href="#/">&larr; All topics</a>
+    <h1>${esc(topic.title)}</h1>
+    ${study}
+    <div class="card"><h2>Tests</h2>${testsHtml}</div>
+    ${historyHtml}
+  `, false);
 }
 
 /* ---------- Router ---------- */
@@ -223,12 +435,17 @@ async function route() {
     await supabase.auth.signOut();
     return;
   }
-  renderAccount();
+
+  const m = path.match(/^\/topic\/([0-9a-f-]{36})$/i);
+  if (m) return renderTopic(m[1]);
+  return renderHome();
 }
 
 if (configured) {
-  supabase.auth.onAuthStateChange((event) => {
-    if (event === "SIGNED_IN" || event === "SIGNED_OUT") route();
+  supabase.auth.onAuthStateChange((event, session) => {
+    if (event === "SIGNED_OUT") route();
+    // Ignore the extra SIGNED_IN events some browsers fire when the tab regains focus.
+    else if (event === "SIGNED_IN" && !(profile && session?.user?.id === profile.id)) route();
   });
 }
 addEventListener("hashchange", route);
