@@ -274,7 +274,7 @@ async function renderHome() {
     ${newestHtml}
     <div class="section-head">
       <h2>All topics</h2>
-      ${teacher ? `<button class="btn small" id="add-topic" type="button">Add topic</button>` : ""}
+      ${teacher ? `<div class="row"><a class="btn small" href="#/new-test">New test</a><button class="btn small ghost" id="add-topic" type="button">Add topic</button></div>` : ""}
     </div>
     ${cards.length
       ? `<ul class="grid" id="grid">${cards.map((c) => cardHtml(c, bestByTopic[c.id])).join("")}</ul>`
@@ -354,6 +354,8 @@ async function renderTopic(id) {
     return showPage(`<a class="back" href="#/">&larr; All topics</a><h1>Topic not found</h1><p>This topic is not available.</p>`, false);
   }
 
+  if (teacher) return renderTeacherTopic(topic);
+
   const { data: tests } = await supabase.from("live_tests")
     .select("id,title,question_count,live_since").eq("topic_id", id).order("created_at");
   const list = tests || [];
@@ -407,6 +409,242 @@ async function renderTopic(id) {
   `, false);
 }
 
+/* ---------- Teacher: question parser ---------- */
+// PARSER START
+const TYPES = ["single", "multiple", "fill_blank", "short_text", "sentence_correction"];
+
+function parseQuestions(text) {
+  const out = [];
+  let cur = null;
+  const flush = () => { if (cur) out.push(finishQuestion(cur, out.length + 1)); cur = null; };
+  for (const raw of String(text).replace(/\r/g, "").split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    let m;
+    if ((m = line.match(/^Q(?:uestion)?\s*\d*\s*[:.)]\s*(.*)$/i))) {
+      flush();
+      cur = { text: m[1], options: [], answer: "", explanation: "", type: "", points: 1, field: "text" };
+    } else if (!cur) {
+      continue;
+    } else if ((m = line.match(/^(?:answer|ans|correct)\s*:\s*(.*)$/i))) {
+      cur.answer = m[1].trim(); cur.field = "answer";
+    } else if ((m = line.match(/^(?:explanation|expl|why)\s*:\s*(.*)$/i))) {
+      cur.explanation = m[1].trim(); cur.field = "explanation";
+    } else if ((m = line.match(/^type\s*:\s*(.*)$/i))) {
+      cur.type = m[1].trim().toLowerCase().replace(/[\s-]+/g, "_");
+    } else if ((m = line.match(/^points?\s*:\s*([\d.]+)/i))) {
+      cur.points = parseFloat(m[1]);
+    } else if (/^[A-H][).]\s/i.test(line)) {
+      const re = /([A-H])[).]\s+(.+?)(?=\s+[A-H][).]\s|$)/gi;
+      let o;
+      while ((o = re.exec(line))) cur.options.push({ k: o[1].toUpperCase(), t: o[2].trim() });
+      cur.field = "options";
+    } else if (cur.field === "text") cur.text += " " + line;
+    else if (cur.field === "explanation") cur.explanation += " " + line;
+  }
+  flush();
+  return out;
+}
+
+function finishQuestion(c, n) {
+  const errors = [];
+  const ans = c.answer;
+  const letters = c.options.map((o) => o.k);
+  let type = c.type ||
+    (c.options.length ? (/[,&;]|\band\b|^[A-H]{2,}$/i.test(ans) ? "multiple" : "single")
+                      : (c.text.includes("___") ? "fill_blank" : "short_text"));
+  if (!TYPES.includes(type)) { errors.push(`Unknown type "${type}"`); type = "single"; }
+  const q = { n, type, text: c.text.trim(), options: null, correct: null,
+              explanation: c.explanation.trim(), points: c.points > 0 ? c.points : 1, errors };
+  if (!q.text) errors.push("Question text is empty");
+  if (!ans) errors.push("Missing Answer: line");
+
+  if (type === "single" || type === "multiple") {
+    q.options = c.options.map((o) => o.t);
+    if (q.options.length < 2) errors.push("Needs at least two options, like: A) in  B) on");
+    const picked = ans.replace(/\band\b/gi, ",").split(/[\s,;&]+/).filter(Boolean)
+      .flatMap((t) => (/^[A-H]+$/i.test(t) ? t.toUpperCase().split("") : [t]));
+    for (const p of picked) if (!letters.includes(p)) errors.push(`Answer "${p}" is not one of the options`);
+    if (type === "single" && picked.length > 1) errors.push("Single choice must have one answer");
+    q.correct = type === "single" ? picked[0] : [...new Set(picked)];
+  } else {
+    q.correct = ans.split("|").map((s) => s.trim()).filter(Boolean);
+  }
+  return q;
+}
+// PARSER END
+
+const SAMPLE = `Q: She is interested ___ music.
+A) in  B) on  C) at  D) for
+Answer: A
+Explanation: interested in + noun
+
+Q: We arrived ___ the airport at six.
+A) in  B) at  C) to  D) on
+Answer: B
+Explanation: arrive at + a specific place
+
+Q: She is good ___ chess.
+Answer: at
+Explanation: good at + noun`;
+
+const fmtDateTime = (d) => new Date(d).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+
+function previewHtml(qs) {
+  if (!qs.length) return `<p class="empty">Your questions will appear here as you type.</p>`;
+  return qs.map((q) => {
+    const body = esc(q.text).replace(/_{3,}/g, `<span class="blank">___</span>`);
+    const opts = q.options
+      ? `<ul class="opts">${q.options.map((o, i) => {
+          const L = "ABCDEFGH"[i];
+          const ok = Array.isArray(q.correct) ? q.correct.includes(L) : q.correct === L;
+          return `<li class="${ok ? "correct" : ""}"><b>${L})</b> ${esc(o)}${ok ? " &#10003;" : ""}</li>`;
+        }).join("")}</ul>`
+      : `<p class="opts-text">Accepted: <b>${esc((q.correct || []).join("  |  "))}</b></p>`;
+    return `<div class="pq ${q.errors.length ? "bad" : ""}">
+      <div><span class="badge plain">${q.n}. ${q.type.replace("_", " ")}</span> <span class="hint">${q.points} pt</span></div>
+      <p class="pq-text">${body}</p>${opts}
+      ${q.explanation ? `<p class="hint">Explanation: ${esc(q.explanation)}</p>` : ""}
+      ${q.errors.map((e) => `<p class="msg error">${esc(e)}</p>`).join("")}</div>`;
+  }).join("");
+}
+
+/* ---------- Teacher: new test page ---------- */
+async function renderNewTest(presetTopic) {
+  showPage(`<a class="back" href="#/">&larr; All topics</a><p class="empty">Loading...</p>`, false);
+  const { data: topics } = await supabase.from("topics").select("id,title").order("sort_order");
+  showPage(`
+    <a class="back" href="#/">&larr; All topics</a>
+    <h1>New test</h1>
+    <div class="card">
+      <div class="field"><label for="nt-topic">Topic</label>
+        <select id="nt-topic">${(topics || []).map((t) =>
+          `<option value="${esc(t.id)}"${t.id === presetTopic ? " selected" : ""}>${esc(t.title)}</option>`).join("")}</select></div>
+      <div class="field"><label for="nt-title">Test title</label>
+        <input id="nt-title" placeholder="Prepositions - Test 2" autocomplete="off"></div>
+      <div class="field"><label for="nt-time">Time limit in minutes (optional)</label>
+        <input id="nt-time" type="number" min="1" inputmode="numeric"></div>
+      <label class="check"><input type="checkbox" id="nt-sq"> Shuffle questions</label>
+      <label class="check"><input type="checkbox" id="nt-so"> Shuffle options</label>
+    </div>
+    <div class="card">
+      <h2>Paste questions</h2>
+      <p class="hint">Start each question with <b>Q:</b>. Options go on one line, then <b>Answer:</b> and <b>Explanation:</b>.
+        Two correct options: <b>Answer: A, C</b>. No options: type the answer, and use <b>|</b> between accepted answers.</p>
+      <textarea id="nt-paste" rows="12" spellcheck="false" placeholder="Q: She is interested ___ music.&#10;A) in  B) on  C) at  D) for&#10;Answer: A&#10;Explanation: interested in"></textarea>
+      <button class="btn ghost small" id="nt-sample" type="button">Insert example</button>
+      <h2 class="gap-top" id="nt-count">Preview</h2>
+      <div id="nt-preview"></div>
+    </div>
+    <p id="msg" class="msg" role="alert"></p>
+    <div class="actions">
+      <button class="btn" data-save="draft" type="button">Save as draft</button>
+      <button class="btn" data-save="publish" type="button">Publish now</button>
+      <div class="schedule"><input type="datetime-local" id="nt-when" aria-label="Publish date and time">
+        <button class="btn ghost" data-save="schedule" type="button">Publish on date</button></div>
+    </div>`, false);
+
+  const $ = (id) => document.getElementById(id);
+  const refresh = () => {
+    const qs = parseQuestions($("nt-paste").value);
+    $("nt-count").textContent = qs.length ? `Preview: ${plural(qs.length, "question", "questions")}` : "Preview";
+    $("nt-preview").innerHTML = previewHtml(qs);
+    return qs;
+  };
+  $("nt-paste").addEventListener("input", refresh);
+  $("nt-sample").addEventListener("click", () => { $("nt-paste").value = SAMPLE; refresh(); });
+  refresh();
+
+  document.querySelector(".actions").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-save]");
+    if (!btn) return;
+    const mode = btn.dataset.save;
+    const qs = refresh();
+    const title = $("nt-title").value.trim();
+    let publishAt = null;
+    if (!$("nt-topic").value) return setMsg("Choose a topic.");
+    if (!title) return setMsg("Enter a test title.");
+    if (!qs.length) return setMsg("Paste at least one question.");
+    const bad = qs.find((q) => q.errors.length);
+    if (bad) return setMsg(`Fix question ${bad.n} first: ${bad.errors[0]}.`);
+    if (mode === "schedule") {
+      if (!$("nt-when").value) return setMsg("Pick a date and time first.");
+      publishAt = new Date($("nt-when").value);
+      if (publishAt <= new Date()) return setMsg("Pick a time in the future.");
+      publishAt = publishAt.toISOString();
+    }
+
+    const all = document.querySelectorAll(".actions button");
+    all.forEach((b) => (b.disabled = true));
+    setMsg("Saving...", "ok");
+    const topicId = $("nt-topic").value;
+    const fail = async (err, testId) => {
+      if (testId) await supabase.from("tests").delete().eq("id", testId);
+      setMsg(`Could not save: ${err.message}`);
+      all.forEach((b) => (b.disabled = false));
+    };
+
+    const { data: t, error } = await supabase.from("tests").insert({
+      topic_id: topicId, title, status: mode === "draft" ? "draft" : "published", publish_at: publishAt,
+      time_limit_minutes: parseInt($("nt-time").value, 10) || null,
+      shuffle_questions: $("nt-sq").checked, shuffle_options: $("nt-so").checked,
+    }).select("id").single();
+    if (error) return fail(error);
+
+    const { data: ins, error: e2 } = await supabase.from("questions").insert(
+      qs.map((q, i) => ({ test_id: t.id, sort_order: i + 1, type: q.type, text: q.text, options: q.options, points: q.points }))
+    ).select("id,sort_order");
+    if (e2) return fail(e2, t.id);
+
+    const { error: e3 } = await supabase.from("question_keys").insert(
+      ins.map((r) => ({ question_id: r.id, correct_answer: qs[r.sort_order - 1].correct, explanation: qs[r.sort_order - 1].explanation || null }))
+    );
+    if (e3) return fail(e3, t.id);
+
+    location.hash = `#/topic/${topicId}`;
+  });
+}
+
+/* ---------- Teacher: topic page with all tests ---------- */
+async function renderTeacherTopic(topic) {
+  const { data: tests } = await supabase.from("tests")
+    .select("id,title,status,publish_at,questions(count)").eq("topic_id", topic.id).order("created_at");
+  const rows = (tests || []).map((t) => {
+    const n = t.questions?.[0]?.count ?? 0;
+    const sched = t.status === "published" && t.publish_at && new Date(t.publish_at) > new Date();
+    const label = t.status === "draft" ? "Draft" : sched ? `Scheduled for ${fmtDateTime(t.publish_at)}` : "Published";
+    return `<div class="test-row" data-id="${esc(t.id)}">
+      <div class="grow"><strong>${esc(t.title)}</strong>
+        <span class="badge ${t.status === "draft" || sched ? "plain" : ""}">${label}</span>
+        <span class="sub">${plural(n, "question", "questions")}</span></div>
+      ${t.status === "draft"
+        ? `<button class="btn small" data-act="publish" type="button">Publish</button>`
+        : `<button class="btn ghost small" data-act="unpublish" type="button">Unpublish</button>`}
+      <button class="btn ghost small danger" data-act="delete" type="button">Delete</button></div>`;
+  }).join("");
+
+  showPage(`
+    <a class="back" href="#/">&larr; All topics</a>
+    <div class="section-head"><h1>${esc(topic.title)}</h1><a class="btn small" href="#/new-test/${esc(topic.id)}">New test</a></div>
+    <div class="card"><h2>Tests</h2>${rows || `<p class="empty">No tests yet. Click New test.</p>`}</div>`, false);
+
+  document.querySelector(".card").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    const id = btn.closest(".test-row").dataset.id;
+    btn.disabled = true;
+    let r;
+    if (btn.dataset.act === "publish") r = await supabase.from("tests").update({ status: "published", publish_at: null }).eq("id", id);
+    else if (btn.dataset.act === "unpublish") r = await supabase.from("tests").update({ status: "draft", publish_at: null }).eq("id", id);
+    else {
+      if (!confirm("Delete this test with its questions and all student attempts? This cannot be undone.")) { btn.disabled = false; return; }
+      r = await supabase.from("tests").delete().eq("id", id);
+    }
+    if (r.error) alert(r.error.message);
+    renderTopic(topic.id);
+  });
+}
+
 /* ---------- Router ---------- */
 async function loadProfile(id) {
   const { data, error } = await supabase.from("profiles").select("*, groups(name)").eq("id", id).single();
@@ -435,6 +673,9 @@ async function route() {
     await supabase.auth.signOut();
     return;
   }
+
+  const nt = path.match(/^\/new-test(?:\/([0-9a-f-]{36}))?$/i);
+  if (nt && isTeacher()) return renderNewTest(nt[1]);
 
   const m = path.match(/^\/topic\/([0-9a-f-]{36})$/i);
   if (m) return renderTopic(m[1]);
