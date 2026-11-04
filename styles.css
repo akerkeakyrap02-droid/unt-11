@@ -1,0 +1,121 @@
+/* English Test Prep — mobile-first, light + dark.
+   Palette borrows the sky blue and gold of the Kazakh flag, kept quiet:
+   navy does the work, gold marks "new / go", sky blue marks focus. */
+
+:root {
+  --bg: #f2f6fa;
+  --surface: #ffffff;
+  --ink: #10213a;
+  --muted: #55667d;
+  --line: #d6e0eb;
+  --primary: #10213a;
+  --on-primary: #ffffff;
+  --sky: #00afca;
+  --gold: #fec50c;
+  --on-gold: #10213a;
+  --danger: #b3261e;
+  --ok: #17703f;
+  --radius: 14px;
+  --font-body: "Atkinson Hyperlegible", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-head: "Bricolage Grotesque", "Atkinson Hyperlegible", system-ui, sans-serif;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0a1626;
+  --surface: #12233b;
+  --ink: #e9eff8;
+  --muted: #a3b3c9;
+  --line: #27415f;
+  --primary: #fec50c;
+  --on-primary: #10213a;
+  --danger: #ff8f87;
+  --ok: #67d391;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { font-size: 112.5%; } /* 18px base for readable phones */
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+  line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
+}
+h1, h2, h3 { font-family: var(--font-head); line-height: 1.15; margin: 0 0 .5em; letter-spacing: -.01em; }
+h1 { font-size: 2rem; font-weight: 800; }
+h2 { font-size: 1.35rem; font-weight: 800; }
+p { margin: 0 0 1em; max-width: 62ch; }
+a { color: inherit; text-underline-offset: 3px; }
+
+:focus-visible { outline: 3px solid var(--sky); outline-offset: 2px; border-radius: 6px; }
+
+/* ---------- Buttons and fields ---------- */
+.btn {
+  appearance: none; border: 2px solid var(--primary); background: var(--primary); color: var(--on-primary);
+  font: inherit; font-weight: 700; min-height: 48px; padding: 0 1.25rem; border-radius: 12px; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: .5rem; text-decoration: none;
+}
+.btn:disabled { opacity: .55; cursor: progress; }
+.btn.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+.btn.small { min-height: 40px; padding: 0 .9rem; font-size: .9rem; }
+.btn.block { width: 100%; }
+
+label { display: block; font-weight: 700; margin: 0 0 .3rem; }
+.field { margin-bottom: 1rem; }
+.hint { color: var(--muted); font-size: .85rem; margin: .3rem 0 0; }
+input, select {
+  width: 100%; min-height: 48px; font: inherit; color: var(--ink); background: var(--surface);
+  border: 2px solid var(--line); border-radius: 12px; padding: 0 .85rem;
+}
+input:focus, select:focus { border-color: var(--sky); }
+
+.msg { min-height: 1.4em; margin: .25rem 0 1rem; font-weight: 700; }
+.msg.error { color: var(--danger); }
+.msg.ok { color: var(--ok); }
+
+/* ---------- Auth screen ---------- */
+.auth { min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+.auth-hero { padding: 1.5rem 1.25rem 1rem; background: var(--primary); color: var(--on-primary); }
+.auth-hero h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+.sample { font-family: var(--font-head); font-weight: 600; font-size: 1.5rem; line-height: 1.3; margin: 0 0 1rem; }
+.gap {
+  display: inline-block; min-width: 3.2ch; border-bottom: 5px solid var(--gold); transform: translateY(2px);
+  text-align: center; color: var(--gold);
+}
+.gap::after { content: "in"; animation: fill 6s steps(1) infinite; }
+@keyframes fill { 0%, 55% { content: "\00a0"; } 56%, 100% { content: "in"; } }
+.chips { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0; padding: 0; list-style: none; }
+.chips li { border: 2px solid currentColor; border-radius: 999px; padding: .1rem .8rem; font-weight: 700; opacity: .85; }
+.chips li.right { background: var(--gold); border-color: var(--gold); color: var(--on-gold); opacity: 1; }
+.auth-panel { padding: 1.5rem 1.25rem 2.5rem; max-width: 30rem; width: 100%; margin: 0 auto; }
+.auth-panel h2 { font-size: 1.6rem; }
+.switch { margin-top: 1.25rem; color: var(--muted); }
+
+@media (min-width: 860px) {
+  .auth { grid-template-columns: 1.1fr 1fr; grid-template-rows: 1fr; }
+  .auth-hero { display: flex; flex-direction: column; justify-content: center; padding: 4rem; }
+  .auth-hero h1 { font-size: 1.4rem; }
+  .sample { font-size: 2.5rem; }
+  .auth-panel { align-self: center; padding: 3rem; }
+}
+
+/* ---------- App shell ---------- */
+.topbar {
+  display: flex; align-items: center; gap: .75rem; padding: .75rem 1.25rem;
+  background: var(--surface); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5;
+}
+.brand { font-family: var(--font-head); font-weight: 800; font-size: 1.1rem; margin-right: auto; }
+.page { max-width: 60rem; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 1.25rem; margin-bottom: 1rem; }
+.badge { display: inline-block; font-size: .8rem; font-weight: 700; padding: .1rem .6rem; border-radius: 999px; background: var(--gold); color: var(--on-gold); }
+.badge.plain { background: transparent; border: 2px solid var(--line); color: var(--muted); }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: .4rem 1.25rem; margin: 0; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; font-weight: 700; word-break: break-word; }
+
+@media (prefers-reduced-motion: reduce) {
+  .gap::after { animation: none; content: "in"; }
+}
