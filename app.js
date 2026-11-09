@@ -274,7 +274,7 @@ async function renderHome() {
     ${newestHtml}
     <div class="section-head">
       <h2>All topics</h2>
-      ${teacher ? `<div class="row"><a class="btn small" href="#/new-test">New test</a><button class="btn small ghost" id="add-topic" type="button">Add topic</button></div>` : ""}
+      ${teacher ? `<div class="row"><a class="btn small" href="#/new-test">New test</a><a class="btn small ghost" href="#/submissions">Student results</a><button class="btn small ghost" id="add-topic" type="button">Add topic</button></div>` : ""}
     </div>
     ${cards.length
       ? `<ul class="grid" id="grid">${cards.map((c) => cardHtml(c, bestByTopic[c.id])).join("")}</ul>`
@@ -925,15 +925,16 @@ function showAns(r, v) {
 async function renderResult(attemptId) {
   showPage(`<p class="empty">Loading...</p>`, false);
   const { data: att } = await supabase.from("attempts")
-    .select("id,score,max_score,time_spent_seconds,submitted_at,tests(title,topic_id)").eq("id", attemptId).maybeSingle();
+    .select("id,score,max_score,time_spent_seconds,submitted_at,tests(title,topic_id),profiles(name)").eq("id", attemptId).maybeSingle();
   if (!att?.submitted_at) return showPage(`<a class="back" href="#/">&larr; All topics</a><h1>Result not found</h1>`, false);
   const { data: rows, error } = await supabase.rpc("get_attempt_review", { p_attempt: attemptId });
   const p = pct(att.score, att.max_score) ?? 0;
   const right = (rows || []).filter((r) => r.is_correct).length;
 
   showPage(`
-    <a class="back" href="#/topic/${esc(att.tests?.topic_id)}">&larr; Back to topic</a>
+    <a class="back" href="${isTeacher() ? "#/submissions" : `#/topic/${esc(att.tests?.topic_id)}`}">&larr; ${isTeacher() ? "All results" : "Back to topic"}</a>
     <h1>${esc(att.tests?.title || "Result")}</h1>
+    ${isTeacher() ? `<p class="hint">Student: <b>${esc(att.profiles?.name || "")}</b></p>` : ""}
     <div class="card score">
       <p class="big">${p}%</p>
       <p><strong>${Number(att.score)} / ${Number(att.max_score)}</strong> points &middot; ${right} of ${(rows || []).length} correct
@@ -951,6 +952,72 @@ async function renderResult(attemptId) {
         ${r.teacher_comment ? `<p class="hint">Teacher: ${esc(r.teacher_comment)}</p>` : ""}
       </section>`).join("")}
   `, false);
+}
+
+/* ---------- Teacher: student results ---------- */
+async function renderSubmissions() {
+  showPage(`<a class="back" href="#/">&larr; All topics</a><h1>Student results</h1><p class="empty">Loading...</p>`);
+  const { data, error } = await supabase.from("attempts")
+    .select("id,score,max_score,submitted_at,time_spent_seconds,profiles(name,username,groups(name)),tests(title,topics(title))")
+    .not("submitted_at", "is", null).order("submitted_at", { ascending: false }).limit(1000);
+  if (error) return showPage(`<a class="back" href="#/">&larr; All topics</a><h1>Student results</h1><p class="msg error">${esc(error.message)}</p>`);
+
+  const rows = (data || []).map((a) => ({
+    id: a.id, student: a.profiles?.name || "?", username: a.profiles?.username || "",
+    group: a.profiles?.groups?.name || "-", topic: a.tests?.topics?.title || "-", test: a.tests?.title || "-",
+    at: a.submitted_at, secs: a.time_spent_seconds || 0, score: Number(a.score), max: Number(a.max_score),
+    pct: pct(a.score, a.max_score) ?? 0,
+  }));
+  const uniq = (k) => [...new Set(rows.map((r) => r[k]))].sort();
+  const optionsFor = (k, label) => `<option value="">${label}</option>` + uniq(k).map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+
+  showPage(`
+    <a class="back" href="#/">&larr; All topics</a>
+    <h1>Student results</h1>
+    <div class="card filters">
+      <input id="f-q" type="search" placeholder="Search student or test" aria-label="Search">
+      <select id="f-group" aria-label="Group">${optionsFor("group", "All groups")}</select>
+      <select id="f-topic" aria-label="Topic">${optionsFor("topic", "All topics")}</select>
+      <label>From <input id="f-from" type="date"></label>
+      <label>To <input id="f-to" type="date"></label>
+      <button class="btn ghost small" id="f-csv" type="button">Export CSV</button>
+    </div>
+    <p class="hint" id="f-sum"></p>
+    <div class="tablewrap"><table class="results">
+      <thead><tr><th>Student</th><th>Group</th><th>Topic</th><th>Test</th><th>Submitted</th><th>Time</th><th>Score</th></tr></thead>
+      <tbody id="f-body"></tbody></table></div>`);
+
+  const $ = (id) => document.getElementById(id);
+  let shown = [];
+  const draw = () => {
+    const q = $("f-q").value.trim().toLowerCase(), g = $("f-group").value, t = $("f-topic").value;
+    const from = $("f-from").value ? new Date($("f-from").value) : null;
+    const to = $("f-to").value ? new Date(`${$("f-to").value}T23:59:59`) : null;
+    shown = rows.filter((r) =>
+      (!g || r.group === g) && (!t || r.topic === t) &&
+      (!q || `${r.student} ${r.username} ${r.test}`.toLowerCase().includes(q)) &&
+      (!from || new Date(r.at) >= from) && (!to || new Date(r.at) <= to));
+    $("f-body").innerHTML = shown.map((r) => `<tr data-id="${esc(r.id)}" tabindex="0">
+      <td>${esc(r.student)}</td><td>${esc(r.group)}</td><td>${esc(r.topic)}</td><td>${esc(r.test)}</td>
+      <td>${fmtDateTime(r.at)}</td><td>${clock(r.secs)}</td><td><b>${r.score}/${r.max}</b> (${r.pct}%)</td></tr>`).join("")
+      || `<tr><td colspan="7" class="empty">No submitted tests yet. Results appear here as soon as a student submits.</td></tr>`;
+    const avg = shown.length ? Math.round(shown.reduce((s, r) => s + r.pct, 0) / shown.length) : 0;
+    $("f-sum").textContent = `${plural(shown.length, "submission", "submissions")} \u00b7 average ${avg}%`;
+  };
+  ["input", "change"].forEach((ev) => document.querySelector(".filters").addEventListener(ev, draw));
+  const open = (e) => { const tr = e.target.closest("tr[data-id]"); if (tr) location.hash = `#/result/${tr.dataset.id}`; };
+  $("f-body").addEventListener("click", open);
+  $("f-body").addEventListener("keydown", (e) => { if (e.key === "Enter") open(e); });
+  $("f-csv").addEventListener("click", () => {
+    const cell = (v) => `"${String(v).replace(/"/g, '""')}"`;
+    const lines = [["Student", "Username", "Group", "Topic", "Test", "Submitted", "Time (s)", "Score", "Max", "Percent"],
+      ...shown.map((r) => [r.student, r.username, r.group, r.topic, r.test, new Date(r.at).toISOString(), r.secs, r.score, r.max, r.pct])]
+      .map((l) => l.map(cell).join(","));
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob(["\uFEFF" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" }));
+    a.download = "results.csv"; a.click(); URL.revokeObjectURL(a.href);
+  });
+  draw();
 }
 
 /* ---------- Router ---------- */
@@ -988,6 +1055,7 @@ async function route() {
   const rm = path.match(/^\/result\/([0-9a-f-]{36})$/i);
   if (rm) return renderResult(rm[1]);
 
+  if (path === "/submissions" && isTeacher()) return renderSubmissions();
   const nt = path.match(/^\/new-test(?:\/([0-9a-f-]{36}))?$/i);
   if (nt && isTeacher()) return renderNewTest(nt[1]);
 
