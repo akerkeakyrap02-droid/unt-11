@@ -385,9 +385,8 @@ async function renderTopic(id) {
             <span class="sub">${plural(t.question_count, "question", "questions")}${
               bestByTest[t.id] != null ? ` &middot; Best score: ${bestByTest[t.id]}%` : ""}</span>
           </div>
-          <button class="btn small" type="button" disabled>Start</button>
-        </div>`).join("") +
-      `<p class="hint">Starting a test arrives in step 4.</p>`
+          <a class="btn small" href="#/test/${esc(t.id)}">Start</a>
+        </div>`).join("")
     : `<p class="empty">Coming soon. New tests are added regularly.</p>`;
 
   const historyHtml = teacher ? "" : `
@@ -493,19 +492,21 @@ const fmtDateTime = (d) => new Date(d).toLocaleString("en-GB", { day: "numeric",
 function previewHtml(qs) {
   if (!qs.length) return `<p class="empty">Your questions will appear here as you type.</p>`;
   return qs.map((q) => {
-    const body = esc(q.text).replace(/_{3,}/g, `<span class="blank">___</span>`);
+    const blank = /_{3,}/.test(q.text);
+    const text = esc(q.text).replace(/_{3,}/g, `<span class="blank">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>`);
     const opts = q.options
-      ? `<ul class="opts">${q.options.map((o, i) => {
+      ? `<div class="optgrid">${q.options.map((o, i) => {
           const L = "ABCDEFGH"[i];
           const ok = Array.isArray(q.correct) ? q.correct.includes(L) : q.correct === L;
-          return `<li class="${ok ? "correct" : ""}"><b>${L})</b> ${esc(o)}${ok ? " &#10003;" : ""}</li>`;
-        }).join("")}</ul>`
-      : `<p class="opts-text">Accepted: <b>${esc((q.correct || []).join("  |  "))}</b></p>`;
-    return `<div class="pq ${q.errors.length ? "bad" : ""}">
-      <div><span class="badge plain">${q.n}. ${q.type.replace("_", " ")}</span> <span class="hint">${q.points} pt</span></div>
-      <p class="pq-text">${body}</p>${opts}
+          return `<div class="opt static${ok ? " ok" : ""}"><span class="chip">${L}</span><span>${esc(o)}${ok ? " &#10003;" : ""}</span></div>`;
+        }).join("")}</div>`
+      : `<p class="ans">Accepted: <b>${esc((q.correct || []).join("  |  "))}</b></p>`;
+    return `<section class="qcard${q.errors.length ? " bad" : ""}">
+      <div class="qhead"><span class="qnum">${q.n}</span>
+        ${blank ? `<span class="qlabel">${q.type.replace("_", " ")} &middot; ${q.points} pt</span>` : `<h3 class="qtext">${text}</h3>`}</div>
+      ${blank ? `<p class="sentence">${text}</p>` : ""}${opts}
       ${q.explanation ? `<p class="hint">Explanation: ${esc(q.explanation)}</p>` : ""}
-      ${q.errors.map((e) => `<p class="msg error">${esc(e)}</p>`).join("")}</div>`;
+      ${q.errors.map((e) => `<p class="msg error">${esc(e)}</p>`).join("")}</section>`;
   }).join("");
 }
 
@@ -645,6 +646,251 @@ async function renderTeacherTopic(topic) {
   });
 }
 
+/* ---------- Student: take a test ---------- */
+let activeTimer = null;
+
+function seeded(str) {
+  let h = 2166136261;
+  for (const c of str) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); }
+  return () => {
+    h += 0x6d2b79f5; let t = h;
+    t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function shuffled(arr, rnd) {
+  const r = [...arr];
+  for (let i = r.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [r[i], r[j]] = [r[j], r[i]]; }
+  return r;
+}
+const clock = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+const hasAnswer = (v) => (Array.isArray(v) ? v.length > 0 : v != null && String(v).trim() !== "");
+const PARTS = {
+  single: ["One correct answer", "Choose the one correct answer from the options."],
+  multiple: ["More than one correct answer", "Choose all the correct answers."],
+  fill_blank: ["Fill in the blank", "Type the missing word or words."],
+  short_text: ["Short answer", "Type your answer."],
+  sentence_correction: ["Sentence correction", "Rewrite the sentence correctly."],
+};
+const blankHtml = (s) => esc(s).replace(/_{3,}/g, `<span class="blank">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>`);
+
+async function renderTest(testId) {
+  showPage(`<a class="back" href="#/">&larr; All topics</a><p class="empty">Loading...</p>`, false);
+  const { data: test } = await supabase.from("live_tests").select("*").eq("id", testId).maybeSingle();
+  if (!test) return showPage(`<a class="back" href="#/">&larr; All topics</a><h1>Test not available</h1>`, false);
+  const { data: qrows } = await supabase.from("questions").select("id,sort_order,type,text,options,points")
+    .eq("test_id", testId).order("sort_order");
+  if (!qrows?.length) return showPage(`<a class="back" href="#/topic/${esc(test.topic_id)}">&larr; Back</a><h1>${esc(test.title)}</h1><p>This test has no questions yet.</p>`, false);
+
+  // Resume an unfinished attempt, or start a new one.
+  let { data: att } = await supabase.from("attempts").select("id,started_at").eq("test_id", testId)
+    .eq("user_id", profile.id).is("submitted_at", null).order("started_at", { ascending: false }).limit(1).maybeSingle();
+  if (!att) {
+    const r = await supabase.from("attempts").insert({ test_id: testId }).select("id,started_at").single();
+    if (r.error) return showPage(`<a class="back" href="#/">&larr; Back</a><p class="msg error">Could not start: ${esc(r.error.message)}</p>`, false);
+    att = r.data;
+  }
+
+  const answers = {}, flagged = new Set(), dirty = new Set();
+  const { data: saved } = await supabase.from("attempt_answers").select("question_id,answer,flagged").eq("attempt_id", att.id);
+  for (const r of saved || []) { answers[r.question_id] = r.answer; if (r.flagged) flagged.add(r.question_id); }
+  const lsKey = `etp-attempt-${att.id}`;
+  try {  // answers typed while offline survive a refresh
+    const local = JSON.parse(localStorage.getItem(lsKey) || "null");
+    if (local) {
+      for (const [id, v] of Object.entries(local.answers || {})) if (JSON.stringify(answers[id] ?? null) !== JSON.stringify(v)) { answers[id] = v; dirty.add(id); }
+      for (const id of local.flagged || []) if (!flagged.has(id)) { flagged.add(id); dirty.add(id); }
+    }
+  } catch { /* ignore */ }
+
+  // Order: grouped by type; shuffles are seeded by the attempt so a refresh keeps the same order.
+  const rnd = seeded(att.id);
+  const typeOrder = [...new Set(qrows.map((q) => q.type))];
+  const ordered = typeOrder.flatMap((t) => {
+    const g = qrows.filter((q) => q.type === t);
+    return test.shuffle_questions ? shuffled(g, rnd) : g;
+  });
+  const opts = {}, byId = {};
+  for (const q of ordered) {
+    byId[q.id] = q;
+    if (q.options) {
+      const o = q.options.map((t, i) => ({ k: "ABCDEFGH"[i], t }));
+      opts[q.id] = test.shuffle_options ? shuffled(o, rnd) : o;
+    }
+  }
+
+  let n = 0, part = 0, html = "";
+  for (const type of typeOrder) {
+    const g = ordered.filter((q) => q.type === type);
+    const pts = [...new Set(g.map((q) => Number(q.points)))];
+    part++;
+    html += `<div class="part-head"><p class="part">Part ${part} &middot; items ${n + 1}-${n + g.length}${pts.length === 1 ? ` &middot; ${pts[0]} point${pts[0] === 1 ? "" : "s"} each` : ""}</p>
+      <h2>${PARTS[type][0]}</h2><p class="instr"><em>Instruction:</em> ${PARTS[type][1]}</p></div>`;
+    for (const q of g) {
+      n++; q.idx = n;
+      const blank = /_{3,}/.test(q.text);
+      html += `<section class="qcard" id="q-${q.id}" data-q="${q.id}">
+        <div class="qhead"><span class="qnum">${n}</span>
+          ${blank ? `<span class="qlabel">Complete the sentence</span>` : `<h3 class="qtext">${blankHtml(q.text)}</h3>`}
+          <button type="button" class="flagbtn" data-flag aria-pressed="false" title="Flag for review" aria-label="Flag for review">&#9873;</button></div>
+        ${blank ? `<p class="sentence">${blankHtml(q.text)}</p>` : ""}
+        ${opts[q.id]
+          ? `<div class="optgrid">${opts[q.id].map((o, i) => `<button type="button" class="opt" data-k="${o.k}" aria-pressed="false"><span class="chip">${"ABCDEFGH"[i]}</span><span>${esc(o.t)}</span></button>`).join("")}</div>`
+          : `<input class="qinput" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Your answer">`}
+      </section>`;
+    }
+  }
+
+  const total = ordered.length;
+  app.innerHTML = `
+    <header class="testbar">
+      <a class="btn ghost small" href="#/topic/${esc(test.topic_id)}">Exit</a>
+      <span class="ttl">${esc(test.title)}</span>
+      <div class="prog"><div class="bar"><i id="pbar"></i></div></div>
+      <span class="meta" id="pcount"></span>
+      <span class="meta">Time <span id="clock">00:00</span></span>
+    </header>
+    <div class="test-wrap">
+      <aside class="qmap"><p class="label">Question map</p>
+        <div class="qmap-grid">${ordered.map((q) => `<button type="button" data-goto="${q.id}" aria-label="Question ${q.idx}">${q.idx}</button>`).join("")}</div>
+        <p class="legend"><span class="k done"></span> Answered <span class="k"></span> Not answered <span class="k fl"></span> Flagged</p>
+        <p class="hint" id="save-status" role="status"></p></aside>
+      <main id="qs">${html}</main>
+    </div>
+    <div class="submitbar"><div><span id="left"></span><button class="btn" id="submit" type="button">Submit test</button></div></div>`;
+
+  const $ = (id) => document.getElementById(id);
+  for (const q of ordered) {
+    const inp = $(`q-${q.id}`).querySelector(".qinput");
+    if (inp && hasAnswer(answers[q.id])) inp.value = answers[q.id];
+  }
+
+  const persist = () => { try { localStorage.setItem(lsKey, JSON.stringify({ answers, flagged: [...flagged] })); } catch { /* ignore */ } };
+  const status = (t) => { $("save-status").textContent = t; };
+  function paint() {
+    let done = 0;
+    for (const q of ordered) {
+      const a = answers[q.id], ok = hasAnswer(a);
+      if (ok) done++;
+      const card = $(`q-${q.id}`);
+      card.querySelectorAll(".opt").forEach((b) => b.setAttribute("aria-pressed", String(Array.isArray(a) ? a.includes(b.dataset.k) : a === b.dataset.k)));
+      card.querySelector("[data-flag]").setAttribute("aria-pressed", String(flagged.has(q.id)));
+      const m = document.querySelector(`[data-goto="${q.id}"]`);
+      m.classList.toggle("done", ok); m.classList.toggle("fl", flagged.has(q.id));
+    }
+    $("pbar").style.width = `${Math.round((done / total) * 100)}%`;
+    $("pcount").textContent = `${done} / ${total} answered`;
+    $("left").textContent = `${plural(total - done, "question", "questions")} left.`;
+    return done;
+  }
+
+  async function flush() {
+    if (!dirty.size) return true;
+    const ids = [...dirty]; dirty.clear();
+    const { error } = await supabase.from("attempt_answers").upsert(
+      ids.map((id) => ({ attempt_id: att.id, question_id: id, answer: answers[id] ?? null, flagged: flagged.has(id) })),
+      { onConflict: "attempt_id,question_id" });
+    if (error) { ids.forEach((i) => dirty.add(i)); status("Not saved yet. Check your connection."); return false; }
+    status("All answers saved."); return true;
+  }
+  let timer = null;
+  const queueSave = () => { clearTimeout(timer); timer = setTimeout(flush, 500); };
+  const setAnswer = (id, v) => { answers[id] = hasAnswer(v) ? v : null; dirty.add(id); paint(); persist(); queueSave(); };
+
+  $("qs").addEventListener("click", (e) => {
+    const card = e.target.closest(".qcard");
+    if (!card) return;
+    const id = card.dataset.q, opt = e.target.closest(".opt");
+    if (opt) {
+      const k = opt.dataset.k;
+      if (byId[id].type === "multiple") {
+        const cur = new Set(answers[id] || []);
+        cur.has(k) ? cur.delete(k) : cur.add(k);
+        setAnswer(id, [...cur].sort());
+      } else setAnswer(id, answers[id] === k ? null : k);
+    } else if (e.target.closest("[data-flag]")) {
+      flagged.has(id) ? flagged.delete(id) : flagged.add(id);
+      dirty.add(id); paint(); persist(); queueSave();
+    }
+  });
+  $("qs").addEventListener("input", (e) => {
+    if (e.target.classList.contains("qinput")) setAnswer(e.target.closest(".qcard").dataset.q, e.target.value);
+  });
+  document.querySelector(".qmap-grid").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-goto]");
+    if (b) $(`q-${b.dataset.goto}`).scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  addEventListener("online", flush);
+  window.onbeforeunload = () => (dirty.size ? "Your latest answers are still saving." : undefined);
+
+  let submitting = false;
+  async function submit(auto) {
+    if (submitting) return;
+    const left = total - paint();
+    if (!auto && !confirm(left ? `You have ${plural(left, "unanswered question", "unanswered questions")}. Submit anyway?` : "Submit your test?")) return;
+    submitting = true; $("submit").disabled = true; clearTimeout(timer);
+    const saved = await flush();
+    if (!saved && !auto) { submitting = false; $("submit").disabled = false; return; }
+    const { error } = await supabase.rpc("submit_attempt", { p_attempt: att.id });
+    if (error) { submitting = false; $("submit").disabled = false; status(error.message); return; }
+    try { localStorage.removeItem(lsKey); } catch { /* ignore */ }
+    clearInterval(activeTimer); window.onbeforeunload = null;
+    location.hash = `#/result/${att.id}`;
+  }
+  $("submit").addEventListener("click", () => submit(false));
+
+  const limit = test.time_limit_minutes ? test.time_limit_minutes * 60 : null;
+  const tick = () => {
+    const el = Math.max(0, Math.floor((Date.now() - new Date(att.started_at).getTime()) / 1000));
+    const t = limit ? Math.max(0, limit - el) : el;
+    $("clock").textContent = clock(t);
+    if (limit && t === 0) { clearInterval(activeTimer); submit(true); }
+  };
+  clearInterval(activeTimer);
+  activeTimer = setInterval(tick, 1000);
+  tick(); paint();
+  if (dirty.size) flush();
+}
+
+/* ---------- Results ---------- */
+function showAns(r, v) {
+  if (!hasAnswer(v)) return "No answer";
+  if (r.type === "single" || r.type === "multiple") {
+    return [].concat(v).map((k) => `${k}) ${esc(r.options?.["ABCDEFGH".indexOf(k)] ?? "")}`).join(", ");
+  }
+  return esc(Array.isArray(v) ? v.join("  |  ") : v);
+}
+
+async function renderResult(attemptId) {
+  showPage(`<p class="empty">Loading...</p>`, false);
+  const { data: att } = await supabase.from("attempts")
+    .select("id,score,max_score,time_spent_seconds,submitted_at,tests(title,topic_id)").eq("id", attemptId).maybeSingle();
+  if (!att?.submitted_at) return showPage(`<a class="back" href="#/">&larr; All topics</a><h1>Result not found</h1>`, false);
+  const { data: rows, error } = await supabase.rpc("get_attempt_review", { p_attempt: attemptId });
+  const p = pct(att.score, att.max_score) ?? 0;
+  const right = (rows || []).filter((r) => r.is_correct).length;
+
+  showPage(`
+    <a class="back" href="#/topic/${esc(att.tests?.topic_id)}">&larr; Back to topic</a>
+    <h1>${esc(att.tests?.title || "Result")}</h1>
+    <div class="card score">
+      <p class="big">${p}%</p>
+      <p><strong>${Number(att.score)} / ${Number(att.max_score)}</strong> points &middot; ${right} of ${(rows || []).length} correct
+        &middot; time ${clock(att.time_spent_seconds || 0)}</p>
+    </div>
+    ${error ? `<p class="msg error">${esc(error.message)}</p>` : ""}
+    ${(rows || []).map((r, i) => `
+      <section class="qcard ${r.is_correct ? "right" : "wrong"}">
+        <div class="qhead"><span class="qnum">${i + 1}</span><h3 class="qtext">${blankHtml(r.q_text)}</h3>
+          <span class="verdict">${r.is_correct ? "&#10003; Correct" : "&#10007; Wrong"}</span></div>
+        <p class="ans">Your answer: <b>${showAns(r, r.answer)}</b></p>
+        ${r.is_correct ? "" : `<p class="ans">Correct answer: <b>${showAns(r, r.correct_answer)}</b></p>`}
+        ${r.explanation ? `<p class="hint">${esc(r.explanation)}</p>` : ""}
+        ${r.teacher_comment ? `<p class="hint">Teacher: ${esc(r.teacher_comment)}</p>` : ""}
+      </section>`).join("")}
+  `, false);
+}
+
 /* ---------- Router ---------- */
 async function loadProfile(id) {
   const { data, error } = await supabase.from("profiles").select("*, groups(name)").eq("id", id).single();
@@ -673,6 +919,12 @@ async function route() {
     await supabase.auth.signOut();
     return;
   }
+
+  clearInterval(activeTimer); window.onbeforeunload = null;
+  const tm = path.match(/^\/test\/([0-9a-f-]{36})$/i);
+  if (tm && !isTeacher()) return renderTest(tm[1]);
+  const rm = path.match(/^\/result\/([0-9a-f-]{36})$/i);
+  if (rm) return renderResult(rm[1]);
 
   const nt = path.match(/^\/new-test(?:\/([0-9a-f-]{36}))?$/i);
   if (nt && isTeacher()) return renderNewTest(nt[1]);
