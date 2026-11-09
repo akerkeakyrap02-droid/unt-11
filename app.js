@@ -477,10 +477,12 @@ function finishQuestion(c, n) {
     if (!c.items.length) errors.push("Add numbered items, like: 1. Infinitive of purpose");
     if (q.options.length < 2) errors.push("Needs lettered options, like: A) ...  B) ...");
     const map = {};
-    for (const part of ans.split(/[,;]+/)) {
-      const mm = part.trim().match(/^(\d+)\s*[-\u2013:=]\s*([A-H])$/i);
+    let next = 1;
+    for (const part of ans.split(/[,;&\s]+/).filter(Boolean)) {
+      const mm = part.match(/^(\d+)\s*[-\u2013:=]\s*([A-H])$/i);
       if (mm) map[+mm[1]] = mm[2].toUpperCase();
-      else if (part.trim()) errors.push(`Cannot read "${part.trim()}". Write answers like: 1-A, 2-C`);
+      else if (/^[A-H]$/i.test(part)) map[next++] = part.toUpperCase();   // "B, A" = item 1 is B, item 2 is A
+      else errors.push(`Cannot read "${part}". Write one letter per numbered line, like: B, A`);
     }
     q.correct = c.items.map((_, i) => map[i + 1] ?? null);
     q.correct.forEach((k, i) => { if (!k) errors.push(`Item ${i + 1} has no answer`); else if (!letters.includes(k)) errors.push(`Item ${i + 1}: "${k}" is not one of the options`); });
@@ -571,7 +573,7 @@ async function renderNewTest(presetTopic) {
     <div class="card">
       <h2>Paste questions</h2>
       <p class="hint">Start each question with <b>Q:</b>. Options go on one line, then <b>Answer:</b> and <b>Explanation:</b>.
-        Two correct options: <b>Answer: A, C</b>. Task title above a sentence: <b>Title:</b>. Shared reading text: <b>Passage:</b>. Matching: numbered lines, then <b>Answer: 1-A, 2-C</b>. No options: type the answer, and use <b>|</b> between accepted answers.</p>
+        Two correct options: <b>Answer: A, C</b>. Task title above a sentence: <b>Title:</b>. Shared reading text: <b>Passage:</b>. Matching: numbered lines, then <b>Answer: B, A</b> (one letter for each numbered line). No options: type the answer, and use <b>|</b> between accepted answers.</p>
       <textarea id="nt-paste" rows="12" spellcheck="false" placeholder="Q: She is interested ___ music.&#10;A) in  B) on  C) at  D) for&#10;Answer: A&#10;Explanation: interested in"></textarea>
       <button class="btn ghost small" id="nt-sample" type="button">Insert example</button>
       <h2 class="gap-top" id="nt-count">Preview</h2>
