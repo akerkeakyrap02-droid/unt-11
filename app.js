@@ -410,29 +410,39 @@ async function renderTopic(id) {
 
 /* ---------- Teacher: question parser ---------- */
 // PARSER START
-const TYPES = ["single", "multiple", "fill_blank", "short_text", "sentence_correction"];
+const TYPES = ["single", "multiple", "matching", "fill_blank", "short_text", "sentence_correction"];
 
 function parseQuestions(text) {
   const out = [];
-  let cur = null;
+  let cur = null, passage = "", inPassage = false;
   const flush = () => { if (cur) out.push(finishQuestion(cur, out.length + 1)); cur = null; };
   for (const raw of String(text).replace(/\r/g, "").split("\n")) {
     const line = raw.trim();
     if (!line) continue;
     let m;
-    if ((m = line.match(/^Q(?:uestion)?\s*\d*\s*[:.)]\s*(.*)$/i))) {
+    if ((m = line.match(/^passage\s*:\s*(.*)$/i))) {
       flush();
-      cur = { text: m[1], options: [], answer: "", explanation: "", type: "", points: 1, field: "text" };
+      passage = /^none$/i.test(m[1].trim()) ? "" : m[1].trim();
+      inPassage = !!passage;
+    } else if ((m = line.match(/^Q(?:uestion)?\s*\d*\s*[:.)]\s*(.*)$/i))) {
+      flush(); inPassage = false;
+      cur = { text: m[1], title: "", items: [], options: [], answer: "", explanation: "", type: "", points: 1, field: "text", passage };
+    } else if (inPassage) {
+      passage += " " + line;
     } else if (!cur) {
       continue;
     } else if ((m = line.match(/^(?:answer|ans|correct)\s*:\s*(.*)$/i))) {
       cur.answer = m[1].trim(); cur.field = "answer";
     } else if ((m = line.match(/^(?:explanation|expl|why)\s*:\s*(.*)$/i))) {
       cur.explanation = m[1].trim(); cur.field = "explanation";
+    } else if ((m = line.match(/^title\s*:\s*(.*)$/i))) {
+      cur.title = m[1].trim();
     } else if ((m = line.match(/^type\s*:\s*(.*)$/i))) {
       cur.type = m[1].trim().toLowerCase().replace(/[\s-]+/g, "_");
     } else if ((m = line.match(/^points?\s*:\s*([\d.]+)/i))) {
       cur.points = parseFloat(m[1]);
+    } else if (!cur.options.length && cur.field !== "answer" && (m = line.match(/^\d+[).]\s+(.+)$/))) {
+      cur.items.push(m[1].trim()); cur.field = "items";
     } else if (/^[A-H][).]\s/i.test(line)) {
       const re = /([A-H])[).]\s+(.+?)(?=\s+[A-H][).]\s|$)/gi;
       let o;
@@ -450,15 +460,31 @@ function finishQuestion(c, n) {
   const ans = c.answer;
   const letters = c.options.map((o) => o.k);
   let type = c.type ||
-    (c.options.length ? (/[,&;]|\band\b|^[A-H]{2,}$/i.test(ans) ? "multiple" : "single")
-                      : (c.text.includes("___") ? "fill_blank" : "short_text"));
+    (c.items.length ? "matching"
+      : c.options.length ? (/[,&;]|\band\b|^[A-H]{2,}$/i.test(ans) ? "multiple" : "single")
+      : (c.text.includes("___") ? "fill_blank" : "short_text"));
   if (!TYPES.includes(type)) { errors.push(`Unknown type "${type}"`); type = "single"; }
-  const q = { n, type, text: c.text.trim(), options: null, correct: null,
-              explanation: c.explanation.trim(), points: c.points > 0 ? c.points : 1, errors };
-  if (!q.text) errors.push("Question text is empty");
+  const head = c.text.trim();
+  const q = { n, type, text: c.title ? `${c.title.trim()}\n${head}` : head, passage: c.passage || "",
+              options: null, correct: null, explanation: c.explanation.trim(),
+              points: c.points > 0 ? c.points : 1, errors };
+  if (!head) errors.push("Question text is empty");
   if (!ans) errors.push("Missing Answer: line");
 
-  if (type === "single" || type === "multiple") {
+  if (type === "matching") {
+    q.options = c.options.map((o) => o.t);
+    q.text = [head, ...c.items.map((t, i) => `${i + 1}. ${t}`)].join("\n");
+    if (!c.items.length) errors.push("Add numbered items, like: 1. Infinitive of purpose");
+    if (q.options.length < 2) errors.push("Needs lettered options, like: A) ...  B) ...");
+    const map = {};
+    for (const part of ans.split(/[,;]+/)) {
+      const mm = part.trim().match(/^(\d+)\s*[-\u2013:=]\s*([A-H])$/i);
+      if (mm) map[+mm[1]] = mm[2].toUpperCase();
+      else if (part.trim()) errors.push(`Cannot read "${part.trim()}". Write answers like: 1-A, 2-C`);
+    }
+    q.correct = c.items.map((_, i) => map[i + 1] ?? null);
+    q.correct.forEach((k, i) => { if (!k) errors.push(`Item ${i + 1} has no answer`); else if (!letters.includes(k)) errors.push(`Item ${i + 1}: "${k}" is not one of the options`); });
+  } else if (type === "single" || type === "multiple") {
     q.options = c.options.map((o) => o.t);
     if (q.options.length < 2) errors.push("Needs at least two options, like: A) in  B) on");
     const picked = ans.replace(/\band\b/gi, ",").split(/[\s,;&]+/).filter(Boolean)
@@ -470,6 +496,16 @@ function finishQuestion(c, n) {
     q.correct = ans.split("|").map((s) => s.trim()).filter(Boolean);
   }
   return q;
+}
+
+// Task title + sentence (+ matching items) rendering, shared by preview, test and results.
+const matchItems = (q) => String(q.text).split("\n").slice(1).map((r) => r.replace(/^\d+[.)]\s*/, ""));
+function stem(q) {
+  const [h, ...rest] = String(q.text).split("\n");
+  if (q.type === "matching") return { head: `<h3 class="qtext">${blankHtml(h)}</h3>`, body: "" };
+  if (rest.length) return { head: `<h3 class="qtext">${blankHtml(h)}</h3>`, body: `<p class="sentence">${blankHtml(rest.join(" "))}</p>` };
+  if (/_{3,}/.test(h)) return { head: `<span class="qlabel">Complete the sentence</span>`, body: `<p class="sentence">${blankHtml(h)}</p>` };
+  return { head: `<h3 class="qtext">${blankHtml(h)}</h3>`, body: "" };
 }
 // PARSER END
 
@@ -491,20 +527,24 @@ const fmtDateTime = (d) => new Date(d).toLocaleString("en-GB", { day: "numeric",
 
 function previewHtml(qs) {
   if (!qs.length) return `<p class="empty">Your questions will appear here as you type.</p>`;
+  let lastPass = "";
   return qs.map((q) => {
-    const blank = /_{3,}/.test(q.text);
-    const text = esc(q.text).replace(/_{3,}/g, `<span class="blank">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>`);
+    const s = stem(q);
+    const keyOf = (L) => (Array.isArray(q.correct) ? q.correct.includes(L) : q.correct === L);
+    const pass = q.passage && q.passage !== lastPass ? `<div class="passage">${esc(q.passage)}</div>` : "";
+    lastPass = q.passage;
+    const items = q.type === "matching"
+      ? `<ol class="mitems">${matchItems(q).map((t, i) => `<li class="mrow"><span class="mtext">${i + 1}. ${esc(t)}</span><b>&rarr; ${esc(q.correct?.[i] || "?")}</b></li>`).join("")}</ol>` : "";
     const opts = q.options
       ? `<div class="optgrid">${q.options.map((o, i) => {
           const L = "ABCDEFGH"[i];
-          const ok = Array.isArray(q.correct) ? q.correct.includes(L) : q.correct === L;
+          const ok = keyOf(L);
           return `<div class="opt static${ok ? " ok" : ""}"><span class="chip">${L}</span><span>${esc(o)}${ok ? " &#10003;" : ""}</span></div>`;
         }).join("")}</div>`
       : `<p class="ans">Accepted: <b>${esc((q.correct || []).join("  |  "))}</b></p>`;
-    return `<section class="qcard${q.errors.length ? " bad" : ""}">
-      <div class="qhead"><span class="qnum">${q.n}</span>
-        ${blank ? `<span class="qlabel">${q.type.replace("_", " ")} &middot; ${q.points} pt</span>` : `<h3 class="qtext">${text}</h3>`}</div>
-      ${blank ? `<p class="sentence">${text}</p>` : ""}${opts}
+    return `${pass}<section class="qcard${q.errors.length ? " bad" : ""}">
+      <div class="qhead"><span class="qnum">${q.n}</span>${s.head}<span class="hint">${q.type.replace("_", " ")} &middot; ${q.points} pt</span></div>
+      ${s.body}${items}${opts}
       ${q.explanation ? `<p class="hint">Explanation: ${esc(q.explanation)}</p>` : ""}
       ${q.errors.map((e) => `<p class="msg error">${esc(e)}</p>`).join("")}</section>`;
   }).join("");
@@ -531,7 +571,7 @@ async function renderNewTest(presetTopic) {
     <div class="card">
       <h2>Paste questions</h2>
       <p class="hint">Start each question with <b>Q:</b>. Options go on one line, then <b>Answer:</b> and <b>Explanation:</b>.
-        Two correct options: <b>Answer: A, C</b>. No options: type the answer, and use <b>|</b> between accepted answers.</p>
+        Two correct options: <b>Answer: A, C</b>. Task title above a sentence: <b>Title:</b>. Shared reading text: <b>Passage:</b>. Matching: numbered lines, then <b>Answer: 1-A, 2-C</b>. No options: type the answer, and use <b>|</b> between accepted answers.</p>
       <textarea id="nt-paste" rows="12" spellcheck="false" placeholder="Q: She is interested ___ music.&#10;A) in  B) on  C) at  D) for&#10;Answer: A&#10;Explanation: interested in"></textarea>
       <button class="btn ghost small" id="nt-sample" type="button">Insert example</button>
       <h2 class="gap-top" id="nt-count">Preview</h2>
@@ -593,7 +633,7 @@ async function renderNewTest(presetTopic) {
     if (error) return fail(error);
 
     const { data: ins, error: e2 } = await supabase.from("questions").insert(
-      qs.map((q, i) => ({ test_id: t.id, sort_order: i + 1, type: q.type, text: q.text, options: q.options, points: q.points }))
+      qs.map((q, i) => ({ test_id: t.id, sort_order: i + 1, type: q.type, text: q.text, options: q.options, points: q.points, passage: q.passage || null }))
     ).select("id,sort_order");
     if (e2) return fail(e2, t.id);
 
@@ -664,21 +704,24 @@ function shuffled(arr, rnd) {
   return r;
 }
 const clock = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
-const hasAnswer = (v) => (Array.isArray(v) ? v.length > 0 : v != null && String(v).trim() !== "");
+const hasAnswer = (v) => (Array.isArray(v) ? v.some((x) => x != null && x !== "") : v != null && String(v).trim() !== "");
 const PARTS = {
-  single: ["One correct answer", "Choose the one correct answer from the options."],
-  multiple: ["More than one correct answer", "Choose all the correct answers."],
+  single: ["One correct answer", "You are offered the test items with one correct answer from four proposed ones."],
+  reading: ["Reading comprehension", "You are offered the test items on the base of text with one correct answer from four proposed ones. Read the text attentively and do the items."],
+  multiple: ["One or more correct answers", "You are offered the test tasks with one or more correct answers from multiple choices. In the test tasks with one or more correct answers there can be up to three correct answers."],
+  matching: ["Matching", "You are offered the questions and answers which should be matched. In these tasks there are two correct answers."],
   fill_blank: ["Fill in the blank", "Type the missing word or words."],
   short_text: ["Short answer", "Type your answer."],
   sentence_correction: ["Sentence correction", "Rewrite the sentence correctly."],
 };
-const blankHtml = (s) => esc(s).replace(/_{3,}/g, `<span class="blank">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>`);
+const gk = (q) => (q.passage ? `reading|${q.passage}` : q.type);
+const blankHtml = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/_{3,}/g, `<span class="blank">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>`);
 
 async function renderTest(testId) {
   showPage(`<a class="back" href="#/">&larr; All topics</a><p class="empty">Loading...</p>`, false);
   const { data: test } = await supabase.from("live_tests").select("*").eq("id", testId).maybeSingle();
   if (!test) return showPage(`<a class="back" href="#/">&larr; All topics</a><h1>Test not available</h1>`, false);
-  const { data: qrows } = await supabase.from("questions").select("id,sort_order,type,text,options,points")
+  const { data: qrows } = await supabase.from("questions").select("id,sort_order,type,text,options,points,passage")
     .eq("test_id", testId).order("sort_order");
   if (!qrows?.length) return showPage(`<a class="back" href="#/topic/${esc(test.topic_id)}">&larr; Back</a><h1>${esc(test.title)}</h1><p>This test has no questions yet.</p>`, false);
 
@@ -705,9 +748,9 @@ async function renderTest(testId) {
 
   // Order: grouped by type; shuffles are seeded by the attempt so a refresh keeps the same order.
   const rnd = seeded(att.id);
-  const typeOrder = [...new Set(qrows.map((q) => q.type))];
-  const ordered = typeOrder.flatMap((t) => {
-    const g = qrows.filter((q) => q.type === t);
+  const groupKeys = [...new Set(qrows.map(gk))];
+  const ordered = groupKeys.flatMap((key) => {
+    const g = qrows.filter((q) => gk(q) === key);
     return test.shuffle_questions ? shuffled(g, rnd) : g;
   });
   const opts = {}, byId = {};
@@ -720,24 +763,33 @@ async function renderTest(testId) {
   }
 
   let n = 0, part = 0, html = "";
-  for (const type of typeOrder) {
-    const g = ordered.filter((q) => q.type === type);
+  for (const key of groupKeys) {
+    const g = ordered.filter((q) => gk(q) === key);
+    const kind = key.split("|")[0];
     const pts = [...new Set(g.map((q) => Number(q.points)))];
     part++;
     html += `<div class="part-head"><p class="part">Part ${part} &middot; items ${n + 1}-${n + g.length}${pts.length === 1 ? ` &middot; ${pts[0]} point${pts[0] === 1 ? "" : "s"} each` : ""}</p>
-      <h2>${PARTS[type][0]}</h2><p class="instr"><em>Instruction:</em> ${PARTS[type][1]}</p></div>`;
+      <h2>${PARTS[kind][0]}</h2><p class="instr"><em>Instruction:</em> ${PARTS[kind][1]}</p></div>`;
+    if (g[0].passage) html += `<div class="passage">${esc(g[0].passage)}</div>`;
     for (const q of g) {
       n++; q.idx = n;
-      const blank = /_{3,}/.test(q.text);
+      const s = stem(q);
+      const letterOf = (k) => "ABCDEFGH"[opts[q.id].findIndex((o) => o.k === k)];
+      const staticOpts = q.options
+        ? `<div class="optgrid">${opts[q.id].map((o, i) => `<div class="opt static"><span class="chip">${"ABCDEFGH"[i]}</span><span>${esc(o.t)}</span></div>`).join("")}</div>` : "";
+      let body;
+      if (q.type === "matching") {
+        body = `<ol class="mitems">${matchItems(q).map((t, i) => `<li class="mrow"><span class="mtext">${i + 1}. ${esc(t)}</span><span class="mpick">${
+          opts[q.id].map((o, j) => `<button type="button" class="mchip" data-i="${i}" data-k="${o.k}" aria-pressed="false" aria-label="Item ${i + 1}: option ${"ABCDEFGH"[j]}">${"ABCDEFGH"[j]}</button>`).join("")}</span></li>`).join("")}</ol>${staticOpts}`;
+      } else if (opts[q.id]) {
+        body = `<div class="optgrid">${opts[q.id].map((o, i) => `<button type="button" class="opt" data-k="${o.k}" aria-pressed="false"><span class="chip">${"ABCDEFGH"[i]}</span><span>${esc(o.t)}</span></button>`).join("")}</div>`;
+      } else {
+        body = `<input class="qinput" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Your answer">`;
+      }
       html += `<section class="qcard" id="q-${q.id}" data-q="${q.id}">
-        <div class="qhead"><span class="qnum">${n}</span>
-          ${blank ? `<span class="qlabel">Complete the sentence</span>` : `<h3 class="qtext">${blankHtml(q.text)}</h3>`}
+        <div class="qhead"><span class="qnum">${n}</span>${s.head}
           <button type="button" class="flagbtn" data-flag aria-pressed="false" title="Flag for review" aria-label="Flag for review">&#9873;</button></div>
-        ${blank ? `<p class="sentence">${blankHtml(q.text)}</p>` : ""}
-        ${opts[q.id]
-          ? `<div class="optgrid">${opts[q.id].map((o, i) => `<button type="button" class="opt" data-k="${o.k}" aria-pressed="false"><span class="chip">${"ABCDEFGH"[i]}</span><span>${esc(o.t)}</span></button>`).join("")}</div>`
-          : `<input class="qinput" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Your answer">`}
-      </section>`;
+        ${s.body}${body}</section>`;
     }
   }
 
@@ -774,6 +826,7 @@ async function renderTest(testId) {
       if (ok) done++;
       const card = $(`q-${q.id}`);
       card.querySelectorAll(".opt").forEach((b) => b.setAttribute("aria-pressed", String(Array.isArray(a) ? a.includes(b.dataset.k) : a === b.dataset.k)));
+      card.querySelectorAll(".mchip").forEach((b) => b.setAttribute("aria-pressed", String(Array.isArray(a) && a[+b.dataset.i] === b.dataset.k)));
       card.querySelector("[data-flag]").setAttribute("aria-pressed", String(flagged.has(q.id)));
       const m = document.querySelector(`[data-goto="${q.id}"]`);
       m.classList.toggle("done", ok); m.classList.toggle("fl", flagged.has(q.id));
@@ -800,8 +853,13 @@ async function renderTest(testId) {
   $("qs").addEventListener("click", (e) => {
     const card = e.target.closest(".qcard");
     if (!card) return;
-    const id = card.dataset.q, opt = e.target.closest(".opt");
-    if (opt) {
+    const id = card.dataset.q, opt = e.target.closest(".opt"), mc = e.target.closest(".mchip");
+    if (mc) {
+      const cur = answers[id] || [], i = +mc.dataset.i;
+      const next = Array.from({ length: matchItems(byId[id]).length }, (_, j) => cur[j] ?? null);
+      next[i] = next[i] === mc.dataset.k ? null : mc.dataset.k;
+      setAnswer(id, next);
+    } else if (opt) {
       const k = opt.dataset.k;
       if (byId[id].type === "multiple") {
         const cur = new Set(answers[id] || []);
@@ -855,6 +913,7 @@ async function renderTest(testId) {
 /* ---------- Results ---------- */
 function showAns(r, v) {
   if (!hasAnswer(v)) return "No answer";
+  if (r.type === "matching") return [].concat(v).map((k, i) => `${i + 1}-${esc(k ?? "?")}`).join(", ");
   if (r.type === "single" || r.type === "multiple") {
     return [].concat(v).map((k) => `${k}) ${esc(r.options?.["ABCDEFGH".indexOf(k)] ?? "")}`).join(", ");
   }
@@ -881,8 +940,9 @@ async function renderResult(attemptId) {
     ${error ? `<p class="msg error">${esc(error.message)}</p>` : ""}
     ${(rows || []).map((r, i) => `
       <section class="qcard ${r.is_correct ? "right" : "wrong"}">
-        <div class="qhead"><span class="qnum">${i + 1}</span><h3 class="qtext">${blankHtml(r.q_text)}</h3>
+        <div class="qhead"><span class="qnum">${i + 1}</span>${stem({ text: r.q_text, type: r.type }).head}
           <span class="verdict">${r.is_correct ? "&#10003; Correct" : "&#10007; Wrong"}</span></div>
+        ${stem({ text: r.q_text, type: r.type }).body}${r.type === "matching" ? `<ol class="mitems">${matchItems({ text: r.q_text }).map((t, i) => `<li>${i + 1}. ${esc(t)}</li>`).join("")}</ol>` : ""}
         <p class="ans">Your answer: <b>${showAns(r, r.answer)}</b></p>
         ${r.is_correct ? "" : `<p class="ans">Correct answer: <b>${showAns(r, r.correct_answer)}</b></p>`}
         ${r.explanation ? `<p class="hint">${esc(r.explanation)}</p>` : ""}
